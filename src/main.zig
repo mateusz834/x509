@@ -139,14 +139,139 @@ pub const Ext = struct {
     value: []const u8,
 
     pub const Extension = union(enum) {
+        authority_key_identifier: AuthorityKeyIdentifier,
+        subject_key_identifier: SubjectKeyIdentifier,
+        key_usage: KeyUsage,
         subject_alt_name: SubjectAlternativeName,
+        basic_constraints: BasicConstraints,
     };
 
     pub fn parse(ext: Ext) !?Extension {
-        if (std.mem.eql(u8, ext.oid, SubjectAlternativeName.OID)) {
+        if (std.mem.eql(u8, ext.oid, AuthorityKeyIdentifier.OID)) {
+            return .{ .authority_key_identifier = try AuthorityKeyIdentifier.parse(ext.value) };
+        } else if (std.mem.eql(u8, ext.oid, SubjectKeyIdentifier.OID)) {
+            return .{ .subject_key_identifier = try SubjectKeyIdentifier.parse(ext.value) };
+        } else if (std.mem.eql(u8, ext.oid, KeyUsage.OID)) {
+            return .{ .key_usage = try KeyUsage.parse(ext.value) };
+        } else if (std.mem.eql(u8, ext.oid, SubjectAlternativeName.OID)) {
             return .{ .subject_alt_name = try SubjectAlternativeName.parse(ext.value) };
+        } else if (std.mem.eql(u8, ext.oid, BasicConstraints.OID)) {
+            return .{ .basic_constraints = try BasicConstraints.parse(ext.value) };
         } else return null;
     }
+
+    pub const AuthorityKeyIdentifier = struct {
+        const OID = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 29, 35 });
+
+        key_identifier: ?[]const u8,
+
+        pub fn parse(der: []const u8) !AuthorityKeyIdentifier {
+            const sequence: u8 = 0x30;
+
+            var decoder = DerDecoder{ .data = der };
+            const seq_raw = try decoder.getElementWithTag(sequence);
+            if (!decoder.empty()) return error.InvalidEncoding;
+
+            var seq_decoder = DerDecoder{ .data = seq_raw };
+
+            var key_identifier: ?[]const u8 = null;
+
+            if (try seq_decoder.getOptionalElementWithTag(0b10000000)) |bytes| {
+                key_identifier = bytes;
+            }
+
+            // not used fields
+            // TODO: validate them acording to ASN.1
+            if (try seq_decoder.getOptionalElementWithTag(0b10000001) != null) {
+                if (try seq_decoder.getOptionalElementWithTag(0b10000010) == null)
+                    return error.InvalidEncoding;
+            }
+
+            if (!seq_decoder.empty()) return error.InvalidEncoding;
+
+            return .{ .key_identifier = key_identifier };
+        }
+    };
+
+    pub const SubjectKeyIdentifier = struct {
+        const OID = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 29, 14 });
+
+        key_identifier: []const u8,
+
+        pub fn parse(der: []const u8) !SubjectKeyIdentifier {
+            const octetstring: u8 = 0x04;
+            var decoder = DerDecoder{ .data = der };
+            const key_identifier = try decoder.getElementWithTag(octetstring);
+            if (!decoder.empty()) return error.InvalidEncoding;
+            return .{ .key_identifier = key_identifier };
+        }
+    };
+
+    pub const KeyUsage = packed struct {
+        const OID = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 29, 15 });
+
+        encipher_only: bool = false,
+        crl_sig: bool = false,
+        key_cert_sig: bool = false,
+        key_agreement: bool = false,
+        data_encipherment: bool = false,
+        key_encipherment: bool = false,
+        non_repudiation: bool = false,
+        digital_signature: bool = false,
+        decipher_only: bool = false,
+
+        pub fn parse(der: []const u8) !KeyUsage {
+            const bitstring: u8 = 0x03;
+
+            var decoder = DerDecoder{ .data = der };
+            const d = try decoder.getBitStringWithTag(bitstring);
+            if (!decoder.empty()) return error.InvalidEncoding;
+
+            // This is a NamedBitList, so ITU-T X690 11.2.2:
+            // 11.2.2 Where Rec. ITU-T X.680 | ISO/IEC 8824-1, 22.7, applies, the bitstring shall have all trailing 0 bits removed before
+            // it is encoded.
+            // NOTE 2 – If a bitstring value has no 1 bits, then an encoder shall encode the value with a length of 1 and an initial octet set to 0.
+            if (d.bytes.len > 2 or (d.bytes.len == 2 and d.padding_bits != 7)) return error.InvalidEncoding;
+
+            // ITU-T X680 22.2:
+            // The first bit in a bit string is called the leading bit. The final bit in a bit string is called the trailing bit.
+            // NOTE – This terminology is used in specifying the value notation and in defining encoding rules.
+            //
+            // ITU-T X680 22.16
+            // When using the "bstring" or "xmlbstring" notation, the leading bit of the bitstring value is on the left, and the
+            // trailing bit of the bitstring value is on the right.
+            //
+            // ITU-T X680 22.4:
+            // The value of each "number" or "DefinedValue" appearing in the "NamedBitList" shall be different, and is the
+            // number of a distinguished bit in a bitstring value.
+            // The leading bit of the bit string is identified by the "number" zero, with succeeding bits having successive values.
+            var usage: u9 = 0;
+            if (d.bytes.len > 0) usage |= @intCast(u9, d.bytes[0]);
+            if (d.bytes.len == 2 and d.bytes[1] != 0) usage |= 256;
+            return @bitCast(KeyUsage, usage);
+        }
+
+        test "parse" {
+            try std.testing.expectEqual(
+                KeyUsage{ .crl_sig = true, .key_cert_sig = true },
+                try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x01, 0b00000110 }),
+            );
+            try std.testing.expectEqual(@bitCast(KeyUsage, @intCast(u9, std.math.maxInt(u9))), try KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x07, 0xff, 0x80 }));
+
+            try std.testing.expectEqual(KeyUsage{ .digital_signature = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x07, 0b10000000 }));
+            try std.testing.expectEqual(KeyUsage{ .non_repudiation = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x06, 0b01000000 }));
+            try std.testing.expectEqual(KeyUsage{ .key_encipherment = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x05, 0b00100000 }));
+            try std.testing.expectEqual(KeyUsage{ .data_encipherment = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x04, 0b00010000 }));
+            try std.testing.expectEqual(KeyUsage{ .key_agreement = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x03, 0b00001000 }));
+            try std.testing.expectEqual(KeyUsage{ .key_cert_sig = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x02, 0b00000100 }));
+            try std.testing.expectEqual(KeyUsage{ .crl_sig = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x01, 0b00000010 }));
+            try std.testing.expectEqual(KeyUsage{ .encipher_only = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x00, 0b00000001 }));
+            try std.testing.expectEqual(KeyUsage{ .decipher_only = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x07, 0b00000000, 0b10000000 }));
+
+            try std.testing.expectError(error.InvalidEncoding, KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x07, 0b00000000, 0b01000000 }));
+            try std.testing.expectError(error.InvalidEncoding, KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x06, 0b00000000, 0b01000000 }));
+        }
+    };
 
     pub const SubjectAlternativeName = struct {
         const OID = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 29, 17 });
@@ -235,6 +360,8 @@ pub const Ext = struct {
 
             var decoder = DerDecoder{ .data = der };
             const seq_raw = try decoder.getElementWithTag(sequence);
+            if (!decoder.empty()) return error.InvalidEncoding;
+
             var seq_decoder = DerDecoder{ .data = seq_raw };
             if (seq_decoder.empty()) return error.InvalidEncoding;
 
@@ -316,6 +443,34 @@ pub const Ext = struct {
             try std.testing.expectEqualDeep(@as(?GeneralName, GeneralName{ .ip = &ipv6_raw }), parsed_iter.next());
             try std.testing.expectEqual(@as(?GeneralName, null), parsed_iter.next());
             try std.testing.expectEqual(@as(?GeneralName, null), parsed_iter.next());
+        }
+    };
+
+    pub const BasicConstraints = struct {
+        const OID = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 29, 19 });
+
+        ca: bool,
+        max_path_length: ?Asn1.Integer = null,
+
+        pub fn parse(der: []const u8) !BasicConstraints {
+            const boolean = 0x01;
+            const sequence: u8 = 0x30;
+
+            var decoder = DerDecoder{ .data = der };
+            var seq_decoder = DerDecoder{ .data = try decoder.getElementWithTag(sequence) };
+            if (!decoder.empty()) return error.InvalidEncoding;
+
+            const ca = try seq_decoder.getBooleanWithDefaultWithTag(false, boolean);
+            const max_path_length = try seq_decoder.getOptionalIntegerBytesWithTag(0x02);
+            if (max_path_length) |m| {
+                if (m[0] & 0x80 != 0) return error.InvalidEncoding;
+            }
+
+            if (!seq_decoder.empty()) return error.InvalidEncoding;
+            return .{
+                .ca = ca,
+                .max_path_length = max_path_length,
+            };
         }
     };
 };
@@ -639,6 +794,7 @@ pub const Name = struct {
 
     test "parse" {
         const cn = "ROOT-CA";
+
         const der = try testBuildName(
             std.testing.allocator,
             &[_]AttributeTypeAndValue{
@@ -1215,6 +1371,13 @@ const Certificate = struct {
 
         const cert = try parse(std.testing.allocator, der);
         if (!cert.validity.isValid(std.time.timestamp())) return error.Expired;
+
+        var iter = cert.exts.?.iterator();
+        while (iter.next()) |ext| {
+            if (try ext.parse()) |e| {
+                std.log.err("{}", .{e});
+            }
+        }
     }
 
     fn decodeBase64Cert(allocator: std.mem.Allocator, cert_base64: []const u8) ![]const u8 {
@@ -1326,6 +1489,11 @@ const DerDecoder = struct {
 
     pub fn getOptionalBitStringWithTag(self: *DerDecoder, tag: u8) !?Asn1.BitString {
         if (try self.getOptionalElementWithTag(tag)) |bytes| return try parseBitString(bytes);
+        return null;
+    }
+
+    pub fn getOptionalIntegerBytesWithTag(self: *DerDecoder, tag: u8) !?Asn1.Integer {
+        if (try self.getOptionalElementWithTag(tag)) |bytes| return try parseInteger(bytes);
         return null;
     }
 
