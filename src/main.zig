@@ -224,15 +224,13 @@ pub const Ext = struct {
             const bitstring: u8 = 0x03;
 
             var decoder = DerDecoder{ .data = der };
-            const d = try decoder.getBitStringWithTag(bitstring);
+            const d = try decoder.getNamedBitStringWithTag(bitstring);
             if (!decoder.empty()) return error.InvalidEncoding;
 
-            // This is a NamedBitList, so ITU-T X690 11.2.2:
-            // 11.2.2 Where Rec. ITU-T X.680 | ISO/IEC 8824-1, 22.7, applies, the bitstring shall have all trailing 0 bits removed before
-            // it is encoded.
-            // NOTE 2 – If a bitstring value has no 1 bits, then an encoder shall encode the value with a length of 1 and an initial octet set to 0.
-            if (d.bytes.len > 2 or (d.bytes.len == 2 and d.padding_bits != 7)) return error.InvalidEncoding;
-
+            // ITU-T X.680:
+            // 22.6 The presence of a "NamedBitList" has no effect on the set of abstract values of this type. Values containing
+            // 1 bits other than the named bits are permitted.
+            //
             // ITU-T X680 22.2:
             // The first bit in a bit string is called the leading bit. The final bit in a bit string is called the trailing bit.
             // NOTE – This terminology is used in specifying the value notation and in defining encoding rules.
@@ -247,7 +245,7 @@ pub const Ext = struct {
             // The leading bit of the bit string is identified by the "number" zero, with succeeding bits having successive values.
             var usage: u9 = 0;
             if (d.bytes.len > 0) usage |= @intCast(u9, d.bytes[0]);
-            if (d.bytes.len == 2 and d.bytes[1] != 0) usage |= 256;
+            if (d.bytes.len > 1 and d.bytes[1] & 0x80 == 0x80) usage |= 256;
             return @bitCast(KeyUsage, usage);
         }
 
@@ -268,8 +266,11 @@ pub const Ext = struct {
             try std.testing.expectEqual(KeyUsage{ .encipher_only = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x02, 0x00, 0b00000001 }));
             try std.testing.expectEqual(KeyUsage{ .decipher_only = true }, try KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x07, 0b00000000, 0b10000000 }));
 
+            try std.testing.expectError(error.InvalidEncoding, KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x07, 0b00000000, 0b00000000 }));
             try std.testing.expectError(error.InvalidEncoding, KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x07, 0b00000000, 0b01000000 }));
-            try std.testing.expectError(error.InvalidEncoding, KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x06, 0b00000000, 0b01000000 }));
+            try std.testing.expectError(error.InvalidEncoding, KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x01, 0b00000000, 0b01000001 }));
+            try std.testing.expectEqual(KeyUsage{}, try KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x06, 0b00000000, 0b01000000 }));
+            try std.testing.expectEqual(@bitCast(KeyUsage, @intCast(u9, std.math.maxInt(u9))), try KeyUsage.parse(&[_]u8{ 0x03, 0x03, 0x00, 0xff, 0xff }));
         }
     };
 
@@ -1436,14 +1437,28 @@ const DerDecoder = struct {
 
         // ITU-T X690: 11.2.1
         // Each unused bit in the final octet of the encoding of a bit string value shall be set to zero.
-        const last_byte = bytes[bytes.len - 1];
-        const zero_bits = ((@intCast(u8, 1) << padding_bits) - 1);
-        if (last_byte & zero_bits != 0) return error.InvalidEncoding;
+        if (@ctz(bytes[bytes.len - 1]) < padding_bits) return error.InvalidEncoding;
 
         return .{
             .padding_bits = padding_bits,
             .bytes = bytes[1..],
         };
+    }
+
+    fn parseNamedBitString(bytes: []const u8) !Asn1.BitString {
+        const bit_string = try parseBitString(bytes);
+
+        // ITU-T X.680: 22.7:
+        // When a "NamedBitList" is used in defining a bitstring type ASN.1 encoding rules are free to add (or remove)
+        // arbitrarily any trailing 0 bits to (or from) values that are being encoded or decoded. Application designers should
+        // therefore ensure that different semantics are not associated with such values which differ only in the number of trailing
+        // 0 bits.
+        // ITU-T X690 11.2.2:
+        // Where Rec. ITU-T X.680 22.7, applies, the bitstring shall have all trailing 0 bits removed before it is encoded.
+        // NOTE 2 – If a bitstring value has no 1 bits, then an encoder shall encode the value with a length of 1 and an initial octet set to 0.
+        if (bit_string.bytes.len > 0 and bit_string.bytes[bit_string.bytes.len - 1] == 0) return error.InvalidEncoding;
+
+        return bit_string;
     }
 
     pub fn parseRawObjectIdentifier(bytes: []const u8) !Asn1.RawObjectIdentifier {
@@ -1473,6 +1488,10 @@ const DerDecoder = struct {
 
     pub fn getBitStringWithTag(self: *DerDecoder, tag: u8) !Asn1.BitString {
         return parseBitString(try self.getElementWithTag(tag));
+    }
+
+    pub fn getNamedBitStringWithTag(self: *DerDecoder, tag: u8) !Asn1.BitString {
+        return parseNamedBitString(try self.getElementWithTag(tag));
     }
 
     pub fn getRawObjectIdentifierWithTag(self: *DerDecoder, tag: u8) !Asn1.RawObjectIdentifier {
