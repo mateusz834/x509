@@ -1,137 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const Asn1 = struct {
-    pub const Identifier = packed struct(u8) {
-        tag: Tag,
-        pc: PC,
-        class: Class,
-
-        pub const Class = enum(u2) {
-            universal,
-            application,
-            context_specific,
-            private,
-        };
-
-        pub const PC = enum(u1) {
-            primitive,
-            constructed,
-        };
-
-        pub const Tag = enum(u5) {
-            boolean = 1,
-            integer = 2,
-            bitstring = 3,
-            octetstring = 4,
-            null = 5,
-            object_identifier = 6,
-            utf8_string = 12,
-            sequence = 16,
-            set = 17,
-            numeric_string = 18,
-            printable_string = 19,
-            t61string = 20,
-            videotex_string = 21,
-            ia5string = 22,
-            utc_time = 23,
-            graphic_string = 25,
-            generalized_time = 24,
-            visible_string = 26,
-            general_string = 27,
-            universal_string = 28,
-            bmp_string = 30,
-            _,
-        };
-    };
-
-    pub const ObjectIdentifier = []const u64;
-
-    fn validateObjectIdentifier(comptime oid: ObjectIdentifier) bool {
-        if (oid.len < 2)
-            return false;
-
-        // X.690: 8.19.4:
-        // The numerical value of the first subidentifier is derived from the values of the first two object identifier components
-        // in the object identifier value being encoded, using the formula:
-        // (X*40) + Y
-        // where X is the value of the first object identifier component and Y is the value of the second object identifier component.
-        // NOTE – This packing of the first two object identifier components recognizes that only three values are allocated from the root node,
-        // and at most 39 subsequent values from nodes reached by X = 0 and X = 1.
-        if (oid[0] > 2 or (oid[0] != 2 and oid[1] >= 40))
-            return false;
-
-        return true;
-    }
-
-    pub fn asRawObjectIdentifier(comptime oid: ObjectIdentifier) RawObjectIdentifier {
-        if (!validateObjectIdentifier(oid)) @compileError("invalid oid");
-
-        var ret = asBase128Int(oid[0] * 40 + oid[1]);
-        for (oid[2..]) |o| {
-            ret = ret ++ asBase128Int(o);
-        }
-        return ret;
-    }
-
-    fn asBase128Int(comptime n: u64) []const u8 {
-        var ret: []const u8 = "";
-
-        var length = 0;
-        if (n == 0) {
-            length = 1;
-        } else {
-            var i = n;
-            while (i > 0) : (i >>= 7) {
-                length += 1;
-            }
-        }
-
-        length -= 1;
-        while (length >= 0) : (length -= 1) {
-            var o = @truncate(u8, n >> length * 7) & 0x7f;
-            if (length != 0) {
-                o |= 0x80;
-            }
-            ret = ret ++ [_]u8{o};
-        }
-
-        return ret;
-    }
-
-    test "asRawObjectIdentifier" {
-        try std.testing.expectEqualSlices(u8, &[_]u8{0x2B}, comptime asRawObjectIdentifier(&[_]u64{ 1, 3 }));
-        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x2B, 0x65, 0x70 }, comptime asRawObjectIdentifier(&[_]u64{ 1, 3, 101, 112 }));
-        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x2B, 0x65, 0x71 }, comptime asRawObjectIdentifier(&[_]u64{ 1, 3, 101, 113 }));
-
-        const sha256WithRSA_OID = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B };
-        try std.testing.expectEqualSlices(u8, &sha256WithRSA_OID, comptime asRawObjectIdentifier(&[_]u64{ 1, 2, 840, 113549, 1, 1, 11 }));
-    }
-
-    // RawObjectIdentifier is a ObjectIdentifier encoded in DER format.
-    // It can be compared using std.mem.eql, there is exacly one possible encoding
-    // of every ObjectIdentifier.
-    pub const RawObjectIdentifier = []const u8;
-
-    pub const BitString = struct {
-        // padding_bits represents the amount of ending bits of the
-        // last byte that are not part of the actual value.
-        // padding_bits must always be equal to 0 when bytes.len == 0.
-        padding_bits: u3,
-
-        // All bits that are ignored (specified in padding_bits) must be set to 0.
-        bytes: []const u8,
-    };
-
-    // Contains a two's complement (big-endian, at least one byte long)
-    // representation of an integer. It encoded in the shortest possible form.
-    pub const Integer = []const u8;
-};
-
-test {
-    _ = Asn1;
-    _ = Asn1.BitString;
-}
+const Asn1 = @import("./der.zig").Asn1;
+const DerDecoder = @import("./der.zig").DerDecoder;
+const DerBuilder = @import("./der.zig").DerBuilder;
 
 pub const Ext = struct {
     oid: Asn1.RawObjectIdentifier,
@@ -274,6 +146,136 @@ pub const Ext = struct {
         }
     };
 
+    // GeneralName contains a parsed general name.
+    // The contents of each specific name is not validated in any way
+    // to the rules specified by the x509 specs (i.e. the dns general name
+    // might not be a valid dns name/hostname or the ip might not be a valid
+    // IPv4/IPv6 binary address), only validations from ASN.1/DER are applied.
+    //
+    // It might be updated in future to containt more fields.
+    pub const GeneralName = union(enum) {
+        rfc822: []const u8,
+        dns: []const u8,
+        url: []const u8,
+        ip: []const u8,
+
+        // There are few unimplemented and The ITU-T X509 spec defines a general name
+        // with (...) at the end, so it might containt more fields in future, but the RFC 5280 does not.
+        _,
+    };
+
+    pub const RawGeneralName = struct {
+        raw: DerDecoder.Element,
+
+        pub fn parse(self: RawGeneralName) !?GeneralName {
+            const context_specific = 0b10000000;
+            const constructed = 0b00100000;
+
+            const oid = 0x06;
+            const sequence: u8 = 0x30;
+            _ = sequence;
+            const set: u8 = 0x31;
+            _ = set;
+
+            switch (self.raw.tag) {
+                // otherName
+                constructed | context_specific | 0x0 => {
+                    var d = DerDecoder{ .data = self.raw.data };
+                    _ = try d.getRawObjectIdentifierWithTag(oid);
+                    var d2 = DerDecoder{ .data = try d.getElementWithTag(constructed | context_specific | 0x00) };
+                    _ = try d2.getElement();
+                    if (!d.empty()) return error.InvalidEncoding;
+                    if (!d2.empty()) return error.InvalidEncoding;
+                    return null;
+                },
+                context_specific | 0x1 => {
+                    if (!isAscii(self.raw.data)) return error.InvalidEncoding;
+                    return .{ .rfc822 = self.raw.data };
+                },
+                context_specific | 0x2 => {
+                    if (!isAscii(self.raw.data)) return error.InvalidEncoding;
+                    return .{ .dns = self.raw.data };
+                },
+                // x400Address
+                context_specific | 0x3 => {
+                    //var d = DerDecoder{ .data = self.raw.data };
+                    //var standard_attributes_decoder = DerDecoder{ .data = try d.getElementWithTag(sequence) };
+                    //if (standard_attributes_decoder.getOptionalElementExplicit(0b01000001)) |country_name| {
+                    //    switch (country_name.tag) {
+                    //        18 => if (!isValidNumericString(country_name.data) or country_name.data != 3)
+                    //            return error.InvalidEncoding,
+                    //        19 => if (!isValidPrintableString(country_name.data, false) or country_name.data != 2)
+                    //            return error.InvalidEncoding,
+                    //        else => return error.InvalidEncoding,
+                    //    }
+                    //}
+                    //if (standard_attributes_decoder.getOptionalElementExplicit(0b01000010)) |admininistration_domain_name| {
+                    //    switch (admininistration_domain_name.tag) {
+                    //        18 => if (!isValidNumericString(admininistration_domain_name.data) or admininistration_domain_name.data > 16)
+                    //            return error.InvalidEncoding,
+                    //        19 => if (!isValidPrintableString(admininistration_domain_name.data, false) or admininistration_domain_name.data > 16)
+                    //            return error.InvalidEncoding,
+                    //        else => return error.InvalidEncoding,
+                    //    }
+                    //}
+                    //if (try d.getOptionalElementWithTag(sequence)) |raw| {
+                    //    var domain_defined_attributes_decoder = DerDecoder{ .data = raw };
+                    //    _ = domain_defined_attributes_decoder;
+                    //}
+                    //if (try d.getOptionalElementWithTag(set)) |raw| {
+                    //    var extension_attributes_decoder = DerDecoder{ .data = raw };
+                    //    _ = extension_attributes_decoder;
+                    //}
+                    //if (!d.empty()) return error.InvalidEncoding;
+                    return null;
+                },
+                // ediPartyName
+                context_specific | 0x5 => {
+                    // This is bit weird, [0] means implicit, but DirectoryString is a choice
+                    // so there is no way to detect the string type, so this must be
+                    // with explicit tagging (probably ASN.1 defines this somewhere).
+                    //
+                    // (This is defined with: DEFINITIONS IMPLICIT TAGS)
+                    //
+                    // EDIPartyName ::= SEQUENCE {
+                    //		nameAssigner            [0]     DirectoryString OPTIONAL,
+                    //		partyName               [1]     DirectoryString }
+                    //
+                    // DirectoryString ::= CHOICE {
+                    //		teletexString       TeletexString   (SIZE (1..MAX)),
+                    // 		printableString     PrintableString (SIZE (1..MAX)),
+                    // 		universalString     UniversalString (SIZE (1..MAX)),
+                    // 		utf8String          UTF8String      (SIZE (1..MAX)),
+                    // 		bmpString           BMPString       (SIZE (1..MAX)) }
+
+                    var d = DerDecoder{ .data = self.raw.data };
+                    if (try d.getOptionalElementExplicit(context_specific | 0x00)) |n| {
+                        const el = try parseDirectoryString(n, null);
+                        if (el.charCount() == 0) return error.InvalidEncoding;
+                    }
+
+                    const el = try parseDirectoryString(try d.getElementExplicit(context_specific | 0x01), null);
+                    if (el.charCount() == 0) return error.InvalidEncoding;
+
+                    if (!d.empty()) return error.InvalidEncoding;
+                    return null;
+                },
+                context_specific | 0x6 => {
+                    if (!isAscii(self.raw.data)) return error.InvalidEncoding;
+                    return .{ .url = self.raw.data };
+                },
+                context_specific | 0x7 => return .{ .ip = self.raw.data },
+                // registeredID
+                context_specific | 0x8 => {
+                    var d = DerDecoder{ .data = self.raw.data };
+                    _ = try d.getRawObjectIdentifierWithTag(oid);
+                    return null;
+                },
+                else => return null,
+            }
+        }
+    };
+
     pub const SubjectAlternativeName = struct {
         const OID = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 29, 17 });
 
@@ -312,49 +314,6 @@ pub const Ext = struct {
         pub fn rawIterator(self: SubjectAlternativeName) RawIterator {
             return .{ .seq_decoder = DerDecoder{ .data = self.raw } };
         }
-
-        // GeneralName contains a parsed general name.
-        // The contents of each specific name is not validated in any way
-        // to the rules specified by the x509 specs (i.e. the dns general name
-        // might not be a valid dns name/hostname or the ip might not be a valid
-        // IPv4/IPv6 binary address), only validations from ASN.1/DER are applied.
-        //
-        // It might be updated in future to containt more fields.
-        pub const GeneralName = union(enum) {
-            rfc822: []const u8,
-            dns: []const u8,
-            url: []const u8,
-            ip: []const u8,
-
-            // There are few unimplemented and The ITU-T X509 spec defines a general name
-            // with (...) at the end, so it might containt more fields in future, but the RFC 5280 does not.
-            _,
-        };
-
-        pub const RawGeneralName = struct {
-            raw: DerDecoder.Element,
-
-            pub fn parse(self: RawGeneralName) !?GeneralName {
-                const context_specific = 0b10000000;
-
-                switch (self.raw.tag) {
-                    context_specific | 0x1 => {
-                        if (!isAscii(self.raw.data)) return error.InvalidEncoding;
-                        return .{ .rfc822 = self.raw.data };
-                    },
-                    context_specific | 0x2 => {
-                        if (!isAscii(self.raw.data)) return error.InvalidEncoding;
-                        return .{ .dns = self.raw.data };
-                    },
-                    context_specific | 0x6 => {
-                        if (!isAscii(self.raw.data)) return error.InvalidEncoding;
-                        return .{ .url = self.raw.data };
-                    },
-                    context_specific | 0x7 => return .{ .ip = self.raw.data },
-                    else => return null,
-                }
-            }
-        };
 
         pub fn parse(der: []const u8) !SubjectAlternativeName {
             const sequence: u8 = 0x30;
@@ -464,7 +423,7 @@ pub const Ext = struct {
             const ca = try seq_decoder.getBooleanWithDefaultWithTag(false, boolean);
             const max_path_length = try seq_decoder.getOptionalIntegerBytesWithTag(0x02);
             if (max_path_length) |m| {
-                if (m[0] & 0x80 != 0) return error.InvalidEncoding;
+                if (m.raw[0] & 0x80 != 0) return error.InvalidEncoding;
             }
 
             if (!seq_decoder.empty()) return error.InvalidEncoding;
@@ -472,6 +431,74 @@ pub const Ext = struct {
                 .ca = ca,
                 .max_path_length = max_path_length,
             };
+        }
+    };
+
+    pub const NameConstraints = struct {
+        const OID = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 29, 30 });
+
+        permitted: ?RawGeneralSubtrees = null,
+        excluded: ?RawGeneralSubtrees = null,
+
+        pub const RawGeneralSubtrees = struct {
+            raw: []const u8,
+
+            pub const RawGeneralSubtree = struct {
+                base: RawGeneralName,
+            };
+
+            pub const RawIterator = struct {
+                seq_decoder: DerDecoder,
+
+                pub fn next(self: *RawIterator) ?RawGeneralSubtree {
+                    if (self.seq_decoder.empty()) return null;
+                    const general_name = self.seq_decoder.getElement() catch unreachable;
+                    return .{ .raw = general_name };
+                }
+            };
+
+            pub fn rawIterator(self: SubjectAlternativeName) RawIterator {
+                return .{ .seq_decoder = DerDecoder{ .data = self.raw } };
+            }
+        };
+
+        pub fn parse(der: []const u8) !NameConstraints {
+            const sequence: u8 = 0x30;
+
+            var decoder = DerDecoder{ .data = der };
+            const seq_raw = try decoder.getElementWithTag(sequence);
+            if (!decoder.empty()) return error.InvalidEncoding;
+
+            var seq_decoder = DerDecoder{ .data = seq_raw };
+
+            if (try seq_decoder.getOptionalElementWithTag(0b01100000)) |raw_permitted_subtrees| {
+                try validateGeneralSubtrees(DerDecoder{ .data = raw_permitted_subtrees });
+            }
+            if (try seq_decoder.getOptionalElementWithTag(0b01100001)) |raw_excluded_subtrees| {
+                try validateGeneralSubtrees(DerDecoder{ .data = raw_excluded_subtrees });
+            }
+
+            if (!seq_decoder.empty()) return error.InvalidEncoding;
+
+            return .{ .raw = seq_raw };
+        }
+
+        fn validateGeneralSubtrees(decoder: DerDecoder) !void {
+            const sequence: u8 = 0x30;
+
+            if (decoder.empty()) return error.InvalidEncoding;
+            while (!decoder.empty()) {
+                var general_subtree = DerDecoder{ .data = try decoder.getElementWithTag(sequence) };
+
+                // TODO: validate GeneralName tag + same in subject alt name.
+                _ = try general_subtree.getElement();
+
+                if (try general_subtree.getOptionalIntegerBytesWithTag(0b01000000)) |int| {
+                    if (int.as(u8)) |val| if (val == 0) return error.InvalidEncoding;
+                }
+                _ = try general_subtree.getOptionalIntegerBytesWithTag(0b01000001);
+                if (!general_subtree.empty()) return error.InvalidEncoding;
+            }
         }
     };
 };
@@ -493,6 +520,13 @@ fn isValidPrintableString(str: []const u8, allow_asterisk: bool) bool {
             char == '(' or char == ')' or char == '+' or char == ',' or
             char == '-' or char == '.' or char == '/' or char == ':' or
             char == '=' or char == '?' or (allow_asterisk and char == '*'))) return false;
+    }
+    return true;
+}
+
+fn isValidNumericString(str: []const u8) bool {
+    for (str) |char| {
+        if (!(std.ascii.isDigit(char) or char == ' ')) return false;
     }
     return true;
 }
@@ -669,6 +703,107 @@ fn parseDirectoryString(el: DerDecoder.Element, opts: ?ParseDirectoryStringOptio
     }
 }
 
+pub const AttributeTypeAndValue = struct {
+    oid: Asn1.RawObjectIdentifier,
+    value: DerDecoder.Element,
+
+    pub const Entry = union(enum) {
+        common_name: DirectoryString,
+        serial_number: []const u8,
+        country: []const u8,
+        province: DirectoryString,
+        organization: DirectoryString,
+        organizational_unit: DirectoryString,
+    };
+
+    const oid_common_name = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 4, 3 });
+    const oid_serial_number = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 4, 5 });
+    const oid_country = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 4, 6 });
+    const oid_state_or_province = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 4, 8 });
+    const oid_organization = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 4, 10 });
+    const oid_organizational_unit = Asn1.asRawObjectIdentifier(&[_]u64{ 2, 5, 4, 11 });
+
+    pub fn parse(self: Name.AttributeTypeAndValue) !?Entry {
+        if (std.mem.eql(u8, oid_common_name, self.oid)) {
+            return .{ .common_name = try parseDirectoryStringWithSizeConstraint(self.value, 1, 64) };
+        } else if (std.mem.eql(u8, oid_serial_number, self.oid)) {
+            if (self.value.tag != 19) return error.InvalidEncoding;
+            if (self.value.data.len == 0) return error.InvalidEncoding;
+            if (self.value.data.len > 64) return error.InvalidEncoding;
+            if (!isValidPrintableString(self.value.data, false)) return error.InvalidEncoding;
+            return .{ .serial_number = self.value.data };
+        } else if (std.mem.eql(u8, oid_country, self.oid)) {
+            if (self.value.tag != 19) return error.InvalidEncoding;
+            if (self.value.data.len != 2) return error.InvalidEncoding;
+            if (!isValidPrintableString(self.value.data, false)) return error.InvalidEncoding;
+            return .{ .country = self.value.data };
+        } else if (std.mem.eql(u8, oid_state_or_province, self.oid)) {
+            return .{ .province = try parseDirectoryStringWithSizeConstraint(self.value, 1, 128) };
+        } else if (std.mem.eql(u8, oid_organization, self.oid)) {
+            return .{ .organization = try parseDirectoryStringWithSizeConstraint(self.value, 1, 64) };
+        } else if (std.mem.eql(u8, oid_organizational_unit, self.oid)) {
+            return .{ .organizational_unit = try parseDirectoryStringWithSizeConstraint(self.value, 1, 64) };
+        } else return null;
+    }
+
+    fn parseDirectoryStringWithSizeConstraint(el: DerDecoder.Element, min: usize, max: usize) !DirectoryString {
+        const d = try parseDirectoryString(el, null);
+        const chars = d.charCount();
+        if (chars < min) return error.InvalidEncoding;
+        if (chars > max) return error.InvalidEncoding;
+        return d;
+    }
+};
+
+pub const RawNameIterator = struct {
+    rdn_sequence: DerDecoder,
+    rdn_set: DerDecoder,
+    prev_set_el: []const u8,
+
+    pub fn init(raw: []const u8) !RawNameIterator {
+        if (raw.len == 0) return error.InvalidEncoding;
+        return .{
+            .rdn_sequence = .{ .data = raw },
+            .rdn_set = .{ .data = &[_]u8{} },
+            .prev_set_el = &[_]u8{},
+        };
+    }
+
+    pub fn next(self: *RawNameIterator) !?Name.AttributeTypeAndValue {
+        const oid = 0x06;
+        const set: u8 = 0x31;
+        const sequence: u8 = 0x30;
+
+        if (self.rdn_set.empty()) {
+            if (self.rdn_sequence.empty()) return null;
+            self.rdn_set = DerDecoder{
+                .data = try self.rdn_sequence.getElementWithTag(set),
+            };
+            self.prev_set_el = &[_]u8{};
+        }
+
+        const raw = try self.rdn_set.getElementWithTag(sequence);
+
+        if (self.prev_set_el.len != 0) {
+            // ITU-T X.690: 11.6 Set-of components
+            // The encodings of the component values of a set-of value shall appear in ascending order, the encodings being compared as
+            // octet strings with the shorter components being padded at their trailing end with 0-octets.
+            // NOTE – The padding octets are for comparison purposes only and do not appear in the encodings.
+            if (!(self.prev_set_el.len < raw.len or std.mem.lessThan(u8, self.prev_set_el, raw)))
+                return error.InvalidEncoding;
+        }
+        self.prev_set_el = raw;
+
+        var atav_decoder = DerDecoder{ .data = raw };
+        const atav = Name.AttributeTypeAndValue{
+            .oid = try atav_decoder.getRawObjectIdentifierWithTag(oid),
+            .value = try atav_decoder.getElement(),
+        };
+        if (!atav_decoder.empty()) return error.InvalidEncoding;
+        return atav;
+    }
+};
+
 pub const Name = struct {
     raw: []const u8,
 
@@ -708,38 +843,22 @@ pub const Name = struct {
     }
 
     pub const RawIterator = struct {
-        rdn_sequence: DerDecoder,
-        rdn_set: DerDecoder,
+        raw_name_iter: RawNameIterator,
 
-        pub fn next(self: *RawIterator) ?AttributeTypeAndValue {
-            const oid = 0x06;
-            const set: u8 = 0x31;
-            const sequence: u8 = 0x30;
-
-            if (self.rdn_set.empty()) {
-                if (self.rdn_sequence.empty()) return null;
-                self.rdn_set = DerDecoder{ .data = self.rdn_sequence.getElementWithTag(set) catch unreachable };
-            }
-
-            var rdn_set = &self.rdn_set;
-            var atav = DerDecoder{ .data = rdn_set.getElementWithTag(sequence) catch unreachable };
-
-            return .{
-                .oid = atav.getRawObjectIdentifierWithTag(oid) catch unreachable,
-                .value = atav.getElement() catch unreachable,
-            };
+        pub fn next(self: *RawIterator) ?Name.AttributeTypeAndValue {
+            return self.raw_name_iter.next() catch unreachable;
         }
     };
 
     pub fn rawIterator(self: Name) RawIterator {
-        return .{ .rdn_sequence = DerDecoder{ .data = self.raw }, .rdn_set = DerDecoder{ .data = &[_]u8{} } };
+        return .{ .raw_name_iter = RawNameIterator.init(self.raw) catch unreachable };
     }
 
     pub const AttributeTypeAndValue = struct {
         oid: Asn1.RawObjectIdentifier,
         value: DerDecoder.Element,
 
-        pub fn parse(self: AttributeTypeAndValue) !?Entry {
+        pub fn parse(self: Name.AttributeTypeAndValue) !?Entry {
             if (std.mem.eql(u8, oid_common_name, self.oid)) {
                 return .{ .common_name = try parseDirectoryStringWithSizeConstraint(self.value, 1, 64) };
             } else if (std.mem.eql(u8, oid_serial_number, self.oid)) {
@@ -771,25 +890,21 @@ pub const Name = struct {
         }
     };
 
+    pub fn empty(name: Name) bool {
+        var itr = name.rawIterator();
+        if (itr.next() == null) return true;
+        return false;
+    }
+
+    pub fn validAsSubject(name: Name, san_crit: bool) bool {
+        if (!name.empty()) return true;
+        if (san_crit) return true;
+        return false;
+    }
+
     pub fn parse(der: []const u8) !Name {
-        const set: u8 = 0x31;
-        const sequence: u8 = 0x30;
-        const oid = 0x06;
-
-        var rdn_sequence = DerDecoder{ .data = der };
-
-        while (!rdn_sequence.empty()) {
-            var relative_distinguished_name_set = DerDecoder{ .data = try rdn_sequence.getElementWithTag(set) };
-            if (relative_distinguished_name_set.empty()) return error.InvalidEncoding;
-
-            while (!relative_distinguished_name_set.empty()) {
-                var attribute_type_and_value_seq = DerDecoder{ .data = try relative_distinguished_name_set.getElementWithTag(sequence) };
-                _ = try attribute_type_and_value_seq.getRawObjectIdentifierWithTag(oid);
-                _ = try attribute_type_and_value_seq.getElement();
-                if (!attribute_type_and_value_seq.empty()) return error.InvalidEncoding;
-            }
-        }
-
+        var iter = try RawNameIterator.init(der);
+        while (try iter.next()) |_| {}
         return .{ .raw = der };
     }
 
@@ -798,7 +913,7 @@ pub const Name = struct {
 
         const der = try testBuildName(
             std.testing.allocator,
-            &[_]AttributeTypeAndValue{
+            &[_]Name.AttributeTypeAndValue{
                 .{ .oid = oid_common_name, .value = .{ .tag = 19, .data = cn } },
                 .{ .oid = oid_common_name, .value = .{ .tag = 12, .data = cn } },
                 .{ .oid = oid_common_name, .value = .{ .tag = 30, .data = &asUtf16BE(cn) } },
@@ -842,7 +957,7 @@ pub const Name = struct {
         try std.testing.expectEqual(expect.len, str.charCount());
     }
 
-    fn testBuildName(allocator: std.mem.Allocator, atavs: []const AttributeTypeAndValue) ![]const u8 {
+    fn testBuildName(allocator: std.mem.Allocator, atavs: []const Name.AttributeTypeAndValue) ![]const u8 {
         const set: u8 = 0x31;
         const sequence: u8 = 0x30;
 
@@ -886,7 +1001,7 @@ pub const Name = struct {
     }
 };
 
-const Certificate = struct {
+pub const Certificate = struct {
     raw: []const u8,
     raw_tbs_certificate: []const u8,
 
@@ -928,6 +1043,19 @@ const Certificate = struct {
     pub const Exts = struct {
         raw: []const u8,
 
+        pub fn hasDuplicates(self: Exts, allocator: std.mem.Allocator) !bool {
+            var map = std.StringHashMap(void).init(allocator);
+            defer map.deinit();
+
+            var iter = self.iterator();
+            while (iter.next()) |ext| {
+                if (map.get(ext.oid)) |_| return true;
+                try map.put(ext.oid, {});
+            }
+
+            return false;
+        }
+
         pub fn getExtByOid(self: Exts, oid: Asn1.RawObjectIdentifier) ?Ext {
             var iter = self.iterator();
             while (iter.next()) |ext| {
@@ -963,6 +1091,55 @@ const Certificate = struct {
         }
     };
 
+    // TODO: RFC 5280 6.1: (What is this??)
+    // However, a CA may issue a certificate to itself to
+    // support key rollover or changes in certificate policies.  These
+    // self-issued certificates are not counted when evaluating path length
+    // or name constraints.
+
+    pub const ParseDiagnostics = struct {
+        detail_error: union(enum) {
+            malformed_certificate,
+            malformed_tbs_certificate,
+            malformed_signature_algorithm,
+            malformed_signature,
+            malformed_version,
+            unsupported_cert_version: Asn1.Integer,
+            malformed_serial_number,
+            malformed_signature_algorithm_identifier,
+            malformed_issuer,
+            malformed_validity,
+            malformed_subject,
+            malformed_public_key_info,
+            malformed_issuer_unique_id,
+            malformed_subject_unique_id,
+            malformed_exts,
+
+            pub fn string(self: @This()) []const u8 {
+                return switch (self) {
+                    .malformed_certificate => "malformed certificate",
+                    .malformed_tbs_certificate => "malformed tbs certificate",
+                    .malformed_signature_algorithm => "malformed signature algorithm",
+                    .malformed_signature => "malformed signature",
+                    .malformed_tbs_certificate => "malformed tbs certificate",
+                    .malformed_version => "malformed version",
+                    .unsupported_cert_version => "unsupported certificate version",
+                    .malformed_serial_number => "malformed serial number",
+                    .malformed_signature_algorithm_identifier => "malformed signature algorithm identifier",
+                    .malformed_issuer => "malformed issuer",
+                    .malformed_validity => "malformed validity",
+                    .malformed_subject => "malformed subject",
+                    .malformed_public_key_info => "malformed public key info",
+                    .malformed_issuer_unique_id => "malformed issuer unique id",
+                    .malformed_subject_unique_id => "malformed subject unique id",
+                    .malformed_exts => "malformed extensions",
+                };
+            }
+        },
+    };
+
+    pub const ParseOptions = struct {};
+
     pub const Error = error{
         InvalidEncoding,
         UnsupportedVersion,
@@ -972,6 +1149,7 @@ const Certificate = struct {
     // Fields in the returned Certificate share memory with the provided der slice.
     // allocator is used only for internal processing, no need to deinit a parsed certificate.
     pub fn parse(allocator: std.mem.Allocator, der: []const u8) Error!Certificate {
+        _ = allocator;
         const sequence: u8 = 0x30;
         const octetstring: u8 = 0x04;
         const oid = 0x06;
@@ -990,15 +1168,14 @@ const Certificate = struct {
             var version_explicit = DerDecoder{ .data = version_explicit_bytes };
             const version_bytes = try version_explicit.getIntegerBytesWithTag(integer);
             if (!version_explicit.empty()) return error.InvalidEncoding;
-
-            if (version_bytes.len == 1) {
-                break :blk if (version_bytes[0] == 0)
+            if (version_bytes.as(u8)) |version| {
+                if (version == 0)
                     // As per DER, default values are not encoded.
                     return error.InvalidEncoding
-                else if (version_bytes[0] == 1)
-                    .v2
-                else if (version_bytes[0] == 2)
-                    .v3
+                else if (version == 1)
+                    break :blk .v2
+                else if (version == 2)
+                    break :blk .v3
                 else
                     return error.UnsupportedVersion;
             } else return error.UnsupportedVersion;
@@ -1011,14 +1188,13 @@ const Certificate = struct {
         // Note: Non-conforming CAs may issue certificates with serial numbers
         // that are negative or zero.  Certificate users SHOULD be prepared to
         // gracefully handle such certificates.
-        const serial_number = try tbs_certificate.getIntegerBytesWithTag(0x02);
+        const serial_number = try tbs_certificate.getIntegerBytesWithTag(integer);
 
         const signature_algorithm_identifier = try parseAlgorithmIdentifier(try tbs_certificate.getElementWithTag(sequence));
 
         const issuer = try Name.parse(try tbs_certificate.getElementWithTag(sequence));
         // 4.1.2.4.  The issuer field MUST contain a non-empty distinguished name (DN).
-        var itr = issuer.rawIterator();
-        if (itr.next() == null) return error.InvalidEncoding;
+        if (issuer.empty()) return error.InvalidEncoding;
 
         const validity = try parseValidity(try tbs_certificate.getElementWithTag(sequence));
         const subject = try Name.parse(try tbs_certificate.getElementWithTag(sequence));
@@ -1043,9 +1219,6 @@ const Certificate = struct {
         if (version == .v3) {
             const extensions_tag = 0b10100000 | 3;
             if (try tbs_certificate.getOptionalElementWithTag(extensions_tag)) |e| {
-                var map = std.StringHashMap(void).init(allocator);
-                defer map.deinit();
-
                 var exts_seq_decoder = DerDecoder{ .data = e };
                 const exts_data = try exts_seq_decoder.getElementWithTag(sequence);
                 if (!exts_seq_decoder.empty()) return error.InvalidEncoding;
@@ -1056,14 +1229,10 @@ const Certificate = struct {
 
                 while (!exts_decoder.empty()) {
                     var extension_decoder = DerDecoder{ .data = try exts_decoder.getElementWithTag(sequence) };
-                    const raw_oid = try extension_decoder.getRawObjectIdentifierWithTag(oid);
+                    _ = try extension_decoder.getRawObjectIdentifierWithTag(oid);
                     _ = try extension_decoder.getBooleanWithDefaultWithTag(false, boolean);
                     _ = try extension_decoder.getElementWithTag(octetstring);
                     if (!extension_decoder.empty()) return error.InvalidEncoding;
-
-                    // Detect duplicate extension.
-                    if (map.get(raw_oid)) |_| return error.InvalidEncoding;
-                    try map.put(raw_oid, {});
                 }
             }
         }
@@ -1092,12 +1261,13 @@ const Certificate = struct {
         // distinguished name may be an empty sequence providing that the subjectAltName extension is present and is flagged
         // as critical. Otherwise, it shall be a non-empty distinguished name (see clause 8.3.2.1).
 
-        if (exts) |extensions| {
-            var ext_iter = extensions.iterator();
-            while (ext_iter.next()) |ext| {
-                _ = try ext.parse();
-            }
-        }
+        //if (exts) |extensions| {
+        //    if (try extensions.hasDuplicates(allocator)) return error.InvalidEncoding;
+        //    var ext_iter = extensions.iterator();
+        //    while (ext_iter.next()) |ext| {
+        //        _ = try ext.parse();
+        //    }
+        //}
 
         return .{
             .raw = der,
@@ -1394,288 +1564,229 @@ const Certificate = struct {
         return der.toOwnedSlice();
     }
 };
+fn validateParent(issuer: *const Certificate, subject: *const Certificate) bool {
+    // for all x in {1, ..., n-1}, the subject of certificate x is
+    // the issuer of certificate x+1;
+    if (!std.mem.eql(u8, issuer.subject.raw, subject.issuer.raw)) return false;
 
-test {
-    _ = Certificate;
+    // The signature on the certificate can be verified using
+    // working_public_key_algorithm, the working_public_key, and
+    // the working_public_key_parameters.
+    const issuer_alg = issuer.subject_public_key_info.algorithm;
+    const subject_alg = subject.signature_algorithm_identifier;
+    if (!std.mem.eql(u8, issuer_alg.algorithm, subject_alg.algorithm)) return false;
+    if (issuer_alg.paramters == null or subject_alg.paramters == null) {
+        if (issuer_alg.paramters != null or subject_alg.paramters != null) return false;
+        if (!std.mem.eql(u8, issuer_alg.paramters.?, subject_alg.paramters.?)) return false;
+    }
 }
 
-const DerDecoder = struct {
-    data: []const u8,
+pub const PathProcessingCertificate = struct {
+    cert: *const Certificate,
+    exts: Extensions,
 
-    pub const Element = struct {
-        tag: u8,
-        data: []const u8,
-    };
-
-    fn parseInteger(bytes: []const u8) !Asn1.Integer {
-        // Integer has a minumum length of 1.
-        if (bytes.len == 0) return error.InvalidEncoding;
-        if (bytes.len == 1) return bytes;
-
-        // Not minimally encoded.
-        // Integer might be prefixed with 0, so that it is not intepreted as negative.
-        if (bytes[0] == 0 and bytes[1] & 0x80 == 0) return error.InvalidEncoding;
-        // The first byte is unnecessary, removing it will result in the
-        // same negative interpretation.
-        if (bytes[0] == 0xff and bytes[1] & 0x80 == 0x80) return error.InvalidEncoding;
-
-        return bytes;
-    }
-
-    fn parseBitString(bytes: []const u8) !Asn1.BitString {
-        if (bytes.len == 0) return error.InvalidEncoding;
-
-        // ITU-T X690: 8.6.2.2 The initial octet shall encode, as an unsigned binary
-        // integer with bit 1 as the least significant bit, the number of
-        // unused bits in the final subsequent octet. The number shall be in the range zero to seven.
-        if (bytes[0] > 7) return error.InvalidEncoding;
-        const padding_bits: u3 = @intCast(u3, bytes[0]);
-
-        // ITU-T X690: 8.6.2.2
-        // If the bitstring is empty, there shall be no subsequent octets, and the initial octet shall be zero.
-        if (bytes.len == 1 and padding_bits != 0) return error.InvalidEncoding;
-
-        // ITU-T X690: 11.2.1
-        // Each unused bit in the final octet of the encoding of a bit string value shall be set to zero.
-        if (@ctz(bytes[bytes.len - 1]) < padding_bits) return error.InvalidEncoding;
-
+    pub fn fromCert(cert: *const Certificate) !PathProcessingCertificate {
         return .{
-            .padding_bits = padding_bits,
-            .bytes = bytes[1..],
+            .cert = cert,
+            .exts = if (cert.exts) |exts| try Extensions.fromExts(exts) else Extensions{},
         };
     }
 
-    fn parseNamedBitString(bytes: []const u8) !Asn1.BitString {
-        const bit_string = try parseBitString(bytes);
+    pub const Extensions = struct {
+        basic_constraints: ?Ext.BasicConstraints = null,
+        key_usage: ?Ext.KeyUsage = null,
+        unhandled_critical: bool = false,
 
-        // ITU-T X.680: 22.7:
-        // When a "NamedBitList" is used in defining a bitstring type ASN.1 encoding rules are free to add (or remove)
-        // arbitrarily any trailing 0 bits to (or from) values that are being encoded or decoded. Application designers should
-        // therefore ensure that different semantics are not associated with such values which differ only in the number of trailing
-        // 0 bits.
-        // ITU-T X690 11.2.2:
-        // Where Rec. ITU-T X.680 22.7, applies, the bitstring shall have all trailing 0 bits removed before it is encoded.
-        // NOTE 2 – If a bitstring value has no 1 bits, then an encoder shall encode the value with a length of 1 and an initial octet set to 0.
-        if (bit_string.bytes.len > 0 and bit_string.bytes[bit_string.bytes.len - 1] == 0) return error.InvalidEncoding;
+        pub fn fromExts(exts: Certificate.Exts) !Extensions {
+            const basic_constraints: ?Ext.BasicConstraints = null;
+            const key_usage: ?Ext.KeyUsage = null;
+            const unhandled_critical = false;
 
-        return bit_string;
-    }
-
-    pub fn parseRawObjectIdentifier(bytes: []const u8) !Asn1.RawObjectIdentifier {
-        if (bytes.len == 0 or bytes[bytes.len - 1] & 0x80 != 0) return error.InvalidEncoding;
-
-        var start: usize = 0;
-
-        for (bytes, 0..) |v, i| {
-            // ITU-T X.690, section 8.19.2:
-            // The subidentifier shall be encoded in the fewest possible octets,
-            // that is, the leading octet of the subidentifier shall not have the value 0x80.
-            if (i == start and v == 0x80) return error.InvalidEncoding;
-            if (v & 0x80 == 0) start = i + 1;
-        }
-
-        if (start == 0) return error.InvalidEncoding;
-
-        return bytes;
-    }
-
-    fn parseBoolean(bytes: []const u8) !bool {
-        if (bytes.len != 1) return error.InvalidEncoding;
-        if (bytes[0] == 0) return false;
-        if (bytes[0] == 0xff) return true;
-        return error.InvalidEncoding;
-    }
-
-    pub fn getBitStringWithTag(self: *DerDecoder, tag: u8) !Asn1.BitString {
-        return parseBitString(try self.getElementWithTag(tag));
-    }
-
-    pub fn getNamedBitStringWithTag(self: *DerDecoder, tag: u8) !Asn1.BitString {
-        return parseNamedBitString(try self.getElementWithTag(tag));
-    }
-
-    pub fn getRawObjectIdentifierWithTag(self: *DerDecoder, tag: u8) !Asn1.RawObjectIdentifier {
-        return parseRawObjectIdentifier(try self.getElementWithTag(tag));
-    }
-
-    pub fn getBooleanWithTag(self: *DerDecoder, tag: u8) !?bool {
-        return parseBoolean(try self.getElementWithTag(tag));
-    }
-
-    pub fn getIntegerBytesWithTag(self: *DerDecoder, tag: u8) !Asn1.Integer {
-        return parseInteger(try self.getElementWithTag(tag));
-    }
-
-    pub fn getOptionalBitStringWithTag(self: *DerDecoder, tag: u8) !?Asn1.BitString {
-        if (try self.getOptionalElementWithTag(tag)) |bytes| return try parseBitString(bytes);
-        return null;
-    }
-
-    pub fn getOptionalIntegerBytesWithTag(self: *DerDecoder, tag: u8) !?Asn1.Integer {
-        if (try self.getOptionalElementWithTag(tag)) |bytes| return try parseInteger(bytes);
-        return null;
-    }
-
-    pub fn getBooleanWithDefaultWithTag(self: *DerDecoder, default: bool, tag: u8) !bool {
-        if (try self.getOptionalElementWithTag(tag)) |bytes| {
-            const value = try parseBoolean(bytes);
-            // ITU-T X690: 11.5 Set and sequence components with default value
-            // The encoding of a set value or sequence value shall not include
-            // an encoding for any component value which is equal to its default value.
-            if (value == default) return error.InvalidEncoding;
-            return value;
-        }
-        return default;
-    }
-
-    pub fn getOptionalElementWithTag(self: *DerDecoder, tag: u8) !?[]const u8 {
-        if (self.peekTag()) |t| {
-            if (tag != t) return null;
-            const e = try self.getElement();
-            return e.data;
-        }
-        return null;
-    }
-
-    pub fn getElementWithTag(self: *DerDecoder, tag: u8) ![]const u8 {
-        const e = try self.getElement();
-        if (e.tag != tag) return error.InvalidEncoding;
-        return e.data;
-    }
-
-    fn peekTag(self: *DerDecoder) ?u8 {
-        if (self.empty()) return null;
-        return self.data[0];
-    }
-
-    pub fn empty(self: *DerDecoder) bool {
-        return self.data.len == 0;
-    }
-
-    pub fn getElement(self: *DerDecoder) !Element {
-        if (self.data.len < 2) return error.InvalidEncoding;
-        const tag = self.data[0];
-        const len = self.data[1];
-        if (len & 0b10000000 == 0) {
-            if (self.data.len < 2 + len) return error.InvalidEncoding;
-            defer self.data = self.data[2 + len ..];
-            return .{
-                .tag = tag,
-                .data = self.data[2 .. 2 + len],
-            };
-        } else {
-            const len_bytes = len & 0b01111111;
-            if (len_bytes == 0 or len_bytes > 4 or self.data.len < 2 + len_bytes) return error.InvalidEncoding;
-            const length = blk: {
-                var l: u32 = 0;
-                for (self.data[2 .. 2 + len_bytes]) |byte| {
-                    l <<= 8;
-                    l |= @intCast(u32, byte);
+            var ca_exts_iter = exts.iterator();
+            while (ca_exts_iter.next()) |ca_raw_ext| {
+                if (std.mem.eql(u8, ca_raw_ext.oid, Ext.BasicConstraints.OID)) {
+                    basic_constraints = try Ext.BasicConstraints.parse(ca_raw_ext.value);
+                } else if (std.mem.eql(u8, ca_raw_ext.oid, Ext.KeyUsage.OID)) {
+                    key_usage = try Ext.KeyUsage.parse(ca_raw_ext.value);
+                } else if (ca_raw_ext.critical) {
+                    unhandled_critical = true;
                 }
-                break :blk l;
-            };
+            }
 
-            if (length <= 128) return error.InvalidEncoding;
-            if (length & @intCast(u32, std.math.maxInt(u8)) << @intCast(u5, (8 * (len_bytes - 1))) == 0) return error.InvalidEncoding;
-
-            if (self.data.len < 2 + len_bytes + length) return error.InvalidEncoding;
-            defer self.data = self.data[2 + len_bytes + length ..];
             return .{
-                .tag = tag,
-                .data = self.data[2 + len_bytes .. 2 + len_bytes + length],
+                .basic_constraints = basic_constraints,
+                .key_usage = key_usage,
+                .unhandled_critical = unhandled_critical,
             };
+        }
+    };
+};
+
+pub const ParsedNameConstraints = struct {
+    permitted: Constraints,
+    excluded: Constraints,
+
+    pub const Constraints = struct {
+        rfc822: []const []const u8,
+        dns: []const []const u8,
+        url: []const []const u8,
+        ip4: []const IPv4,
+        ip6: []const IPv6,
+
+        pub const IPv4 = struct { addr: [4]u8, mask: u8 };
+        pub const IPv6 = struct { addr: [16]u8, mask: u8 };
+    };
+};
+
+pub const PathProcessingChainCertificate = struct {
+    cert: Certificate,
+    name_constraints: NameConstraints,
+
+    pub const NameConstraints = union(enum) {
+        raw: Ext.NameConstraints,
+        parsed: *ParsedNameConstraints,
+    };
+};
+
+pub const PathProcessingCert = union(enum) {
+    raw: *PathProcessingCertificate,
+    parsed: *PathProcessingCertificate,
+};
+
+pub const PathValidationState = struct {
+    max_path_length: usize = std.math.maxInt(usize),
+
+    pub fn isValidForChain(self: *PathValidationState, ctx: type, err: type, chain_next: fn (c: ctx) err!PathProcessingCert, cert: PathProcessingCertificate) err!bool {
+        while (try chain_next()) |ca| {
+            switch (ca) {
+                inline else => |c| if (std.mem.eql(u8, c.cert.raw, cert.cert.raw)) return false,
+            }
+        }
+
+        if (self.max_path_length == 0) return false;
+        self.max_path_length -= 1;
+
+        if (cert.exts.basic_constraints) |basic_constraints| {
+            // cert is not a Certificate Authority.
+            if (!basic_constraints.ca) return false;
+            if (basic_constraints.max_path_length) |ca_max_path_length_asn1_integer| {
+                // Map the ASN1.Integer to usize, when the max_path_length is bigger than usize,
+                // then there is nothing to do, because the chain slice can't be bigger than usize.
+                if (ca_max_path_length_asn1_integer.as(usize)) |ca_max_path_length| {
+                    if (ca_max_path_length < self.max_path_length) {
+                        self.max_path_length = ca_max_path_length;
+                    }
+                }
+            } else {
+                // RFC 5280 4.2.1.9:
+                // If the basic constraints extension is not present in a
+                // version 3 certificate, or the extension is present but the cA boolean
+                // is not asserted, then the certified public key MUST NOT be used to
+                // verify certificate signatures.
+                return false;
+            }
         }
     }
 };
 
-const DerBuilder = struct {
-    list: std.ArrayList(u8),
-    depth: if (builtin.mode == .Debug) usize else u0 = 0,
+pub fn validateChain(chain: []*const Certificate, now_utc: i64) !bool {
+    if (chain.len < 2) return false;
 
-    pub const Prefixed = struct {
-        startLen: usize,
-    };
+    // Trust anchor must be self-signed.
+    if (!std.mem.eql(u8, chain[0].subject.raw, chain[0].issuer.raw)) return false;
 
-    pub fn newPrefixed(self: *DerBuilder, tag: u8) !Prefixed {
-        if (builtin.mode == .Debug) self.depth += 1;
+    for (chain) |n| if (!n.validity.isValid(now_utc)) return false;
 
-        try self.list.appendSlice(&[_]u8{ tag, 0 });
-        return .{ .startLen = self.list.items.len };
+    // A certificate MUST NOT appear more than once in a prospective
+    // certification path.
+    //
+    // The first certificate (trust anchor) can be excluded, because
+    // it is self-signed, so it would be rejected in the loop above.
+    // Certificate chains aren't that long, so the O(n^2) should be fine here.
+    // For example golang (crypto/x509) bundling limits the total signature checks (up to 100)
+    // https://github.com/golang/go/blob/7bc3281747030877e13d218ba12c6e95fcf4e7d4/src/crypto/x509/verify.go#L892C1-L896
+    // TODO: might also limit the max chain length here and/or use StringHashMap with allocator.
+    for (chain[1..], 0..) |n, ni| {
+        for (chain[1..], 0..) |n2, n2i| {
+            if (ni == n2i) continue;
+            if (std.mem.eql(u8, n.raw, n2.raw)) return false;
+        }
     }
 
-    pub fn endPrefixed(self: *DerBuilder, p: Prefixed) !void {
-        if (builtin.mode == .Debug) self.depth -= 1;
+    // RFC 5280 4.2.1.9: it gives the
+    // maximum number of non-self-issued intermediate certificates that may
+    // follow this certificate in a valid certification path.  (Note: The
+    // last certificate in the certification path is not an intermediate
+    // certificate, and is not included in this limit.
+    // A pathLenConstraint of zero indicates that no non-
+    // self-issued intermediate CA certificates may follow in a valid
+    // certification path.
+    var max_path_length: usize = std.math.maxInt(usize);
 
-        const endLen = self.list.items.len;
-        var len = endLen - p.startLen;
-        if (len < 0b10000000) {
-            self.list.items[p.startLen - 1] = @intCast(u8, len);
-        } else {
-            var lenBytes: u8 = if (len > std.math.maxInt(u24)) @panic("value too big") else if (len > std.math.maxInt(u16)) 3 else if (len > std.math.maxInt(u8)) 2 else 1;
-            try self.list.appendNTimes(undefined, lenBytes);
-            std.mem.copyBackwards(u8, self.list.items[p.startLen + lenBytes ..], self.list.items[p.startLen..endLen]);
+    for (chain[0 .. chain.len - 1], chain[1..]) |n1, n2| {
+        // for all x in {1, ..., n-1}, the subject of certificate x is
+        // the issuer of certificate x+1;
+        if (!std.mem.eql(u8, n1.subject.raw, n2.issuer.raw)) return false;
 
-            self.list.items[p.startLen - 1] = 0b10000000 | lenBytes;
+        // The signature on the certificate can be verified using
+        // working_public_key_algorithm, the working_public_key, and
+        // the working_public_key_parameters.
+        const n1_alg = n1.subject_public_key_info.algorithm;
+        const n2_alg = n2.signature_algorithm_identifier;
+        if (!std.mem.eql(u8, n1_alg.algorithm, n2_alg.algorithm)) return false;
+        if (n1_alg.paramters == null or n2_alg.paramters == null) {
+            if (n1_alg.paramters != null or n2_alg.paramters != null) return false;
+            if (!std.mem.eql(u8, n1_alg.paramters.?, n2_alg.paramters.?)) return false;
+        }
+        // TODO: verify signature of n2 using n1 key.
 
-            var len_bytes = self.list.items[p.startLen .. p.startLen + lenBytes];
-            var i: isize = @intCast(isize, len_bytes.len) - 1;
-            while (i >= 0) {
-                len_bytes[@intCast(usize, i)] = @truncate(u8, len);
-                len >>= 8;
-                i -= 1;
+        const ca_cert = n1;
+
+        if (max_path_length == 0) return false;
+        max_path_length -= 1;
+
+        if (ca_cert.exts) |ca_exts| {
+            var ca_exts_iter = ca_exts.iterator();
+            while (ca_exts_iter.next()) |ca_raw_ext| {
+                if (std.mem.eql(u8, ca_raw_ext.oid, Ext.BasicConstraints.OID)) {
+                    const basic_constraints = try Ext.BasicConstraints.parse(ca_raw_ext.value);
+                    // ca_cert is not a Certificate Authority.
+                    if (!basic_constraints.ca) return false;
+                    if (basic_constraints.max_path_length) |ca_max_path_length_asn1_integer| {
+                        // Map the ASN1.Integer to usize, when the max_path_length is bigger than usize,
+                        // then there is nothing to do, because the chain slice can't be bigger than usize.
+                        if (ca_max_path_length_asn1_integer.as(usize)) |ca_max_path_length| {
+                            if (ca_max_path_length < max_path_length) {
+                                max_path_length = ca_max_path_length;
+                            }
+                        }
+                    } else {
+                        // RFC 5280 4.2.1.9:
+                        // If the basic constraints extension is not present in a
+                        // version 3 certificate, or the extension is present but the cA boolean
+                        // is not asserted, then the certified public key MUST NOT be used to
+                        // verify certificate signatures.
+                        return false;
+                    }
+                } else if (std.mem.eql(u8, ca_raw_ext.oid, Ext.KeyUsage.OID)) {
+                    const key_usage = try Ext.KeyUsage.parse(ca_raw_ext.value);
+                    // If a key usage extension is present, verify that the keyCertSign bit is set.
+                    if (!key_usage.key_cert_sig) return false;
+                } else if (ca_raw_ext.critical) {
+                    // Unhandled critical extension.
+                    return false;
+                }
             }
         }
     }
 
-    pub fn deinit(self: *DerBuilder) void {
-        if (builtin.mode == .Debug and self.depth != 0) @panic("deinit() called on derBuilder when depth != 0");
-        self.list.deinit();
-    }
-
-    // appendOID appends OID to the builder, oid must fit into
-    // the ene byte length DER encoding.
-    pub fn appendOID(self: *DerBuilder, oid: []const u8) !void {
-        try self.list.append(0x06);
-        try self.list.append(@intCast(u8, oid.len));
-        try self.list.appendSlice(oid);
-    }
-};
-
-test "der builder small length" {
-    var builder = DerBuilder{ .list = std.ArrayList(u8).init(std.testing.allocator) };
-    defer builder.deinit();
-
-    var prefixed = try builder.newPrefixed(10);
-    try builder.list.append(1);
-    try builder.list.append(1);
-    try builder.list.append(1);
-
-    var prefixed2 = try builder.newPrefixed(12);
-    try builder.list.append(1);
-    try builder.endPrefixed(prefixed2);
-
-    try builder.endPrefixed(prefixed);
-
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 6, 1, 1, 1, 12, 1, 1 }, builder.list.items);
+    return true;
 }
 
-test "der builder big length" {
-    var builder = DerBuilder{ .list = std.ArrayList(u8).init(std.testing.allocator) };
-    defer builder.deinit();
+test "n" {
+    _ = validateChain(&[_]*const Certificate{}, 11) catch false;
+}
 
-    var content = "aa" ** 120;
-
-    var prefixed = try builder.newPrefixed(10);
-    try builder.list.appendSlice(content);
-    try builder.list.appendSlice(content);
-
-    var prefixed2 = try builder.newPrefixed(12);
-    try builder.list.appendSlice(content);
-    try builder.endPrefixed(prefixed2);
-
-    try builder.endPrefixed(prefixed);
-
-    var expect = [_]u8{ 10, 0b10000010, 0x02, 0xD3 } ++ content ++ content ++ [_]u8{ 12, 0b10000001, 240 } ++ content;
-
-    try std.testing.expectEqualSlices(u8, expect, builder.list.items);
+test {
+    _ = Certificate;
 }
